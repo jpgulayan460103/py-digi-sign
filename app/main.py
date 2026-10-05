@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import uuid
@@ -7,7 +8,7 @@ from fractions import Fraction
 
 from PIL import Image, ImageOps
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Any, List, Tuple, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -40,6 +41,78 @@ def clamp_signature_size(width: Optional[int], height: Optional[int]) -> Tuple[i
     w = width if width is not None else MIN_SIGNATURE_SIZE[0]
     h = height if height is not None else MIN_SIGNATURE_SIZE[1]
     return max(w, MIN_SIGNATURE_SIZE[0]), max(h, MIN_SIGNATURE_SIZE[1])
+
+
+@dataclass
+class PageSignature:
+    """One visible signature: which page, where, and how big."""
+    page: int
+    box_x: int
+    box_y: int
+    width: int = MIN_SIGNATURE_SIZE[0]
+    height: int = MIN_SIGNATURE_SIZE[1]
+
+    @property
+    def size(self) -> Tuple[int, int]:
+        return self.width, self.height
+
+
+_ALLOWED_KEYS = {"page", "box_x", "box_y", "signature_width", "signature_height"}
+_REQUIRED_KEYS = ("page", "box_x", "box_y")
+
+
+def _as_int(value: Any, label: str) -> int:
+    # bool is a subclass of int in Python, and floats like 1.5 must not be truncated silently
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be a whole number, got {value!r}")
+    return value
+
+
+def parse_page_settings(raw: str) -> List[PageSignature]:
+    """Parse the `page_settings` JSON array into validated PageSignature objects.
+
+    Example:
+        [{"page": 0, "box_x": 50, "box_y": 50},
+         {"page": 1, "box_x": 300, "box_y": 600, "signature_width": 250, "signature_height": 90}]
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"page_settings is not valid JSON: {e}")
+
+    if not isinstance(data, list) or not data:
+        raise ValueError("page_settings must be a non-empty JSON array")
+
+    result: List[PageSignature] = []
+    for i, item in enumerate(data):
+        where = f"page_settings[{i}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{where} must be an object")
+
+        missing = [k for k in _REQUIRED_KEYS if k not in item]
+        if missing:
+            raise ValueError(f"{where} is missing required field(s): {', '.join(missing)}")
+        unknown = sorted(set(item) - _ALLOWED_KEYS)
+        if unknown:
+            raise ValueError(
+                f"{where} has unknown field(s): {', '.join(unknown)} "
+                f"(allowed: {', '.join(sorted(_ALLOWED_KEYS))})"
+            )
+
+        page = _as_int(item["page"], f"{where}.page")
+        if page < 0:
+            raise ValueError(f"{where}.page must be 0 or greater")
+        box_x = _as_int(item["box_x"], f"{where}.box_x")
+        box_y = _as_int(item["box_y"], f"{where}.box_y")
+
+        width = item.get("signature_width")
+        height = item.get("signature_height")
+        width = _as_int(width, f"{where}.signature_width") if width is not None else None
+        height = _as_int(height, f"{where}.signature_height") if height is not None else None
+        w, h = clamp_signature_size(width, height)
+
+        result.append(PageSignature(page, box_x, box_y, w, h))
+    return result
 
 
 def delete_temp_files(files: list):
@@ -226,6 +299,59 @@ def sign_pdf(input_pdf: str, output_pdf: str, signature: SignatureConfig, page: 
     return output_pdf
 
 
+def sign_pdf_multiple(
+    input_pdf: str,
+    output_pdf: str,
+    pfx_path: str,
+    passphrase: bytes,
+    placements: List[PageSignature],
+    background_img: Optional[str] = None,
+) -> str:
+    """Sign the PDF once per placement, each with its own real signature field.
+
+    Each pass signs the output of the previous one (incremental updates), so earlier
+    signatures stay valid. The actual signing is done by the existing sign_pdf().
+    """
+    # Check every page up front so we fail before doing any signing work.
+    with open(input_pdf, "rb") as f:
+        page_count = int(IncrementalPdfFileWriter(f).root["/Pages"]["/Count"])
+    for i, p in enumerate(placements):
+        if p.page >= page_count:
+            raise ValueError(
+                f"page_settings[{i}].page {p.page} is out of range: "
+                f"the document has {page_count} page(s) (0-indexed)"
+            )
+
+    current_input = input_pdf
+    intermediates: List[str] = []
+
+    try:
+        for idx, p in enumerate(placements):
+            is_last = idx == len(placements) - 1
+            step_output = output_pdf if is_last else f"{output_pdf}.step{idx}.pdf"
+
+            sign_pdf(
+                input_pdf=current_input,
+                output_pdf=step_output,
+                signature=SignatureConfig(
+                    box=(p.box_x, p.box_y),
+                    pfx_path=pfx_path,
+                    passphrase=passphrase,
+                    background_img=background_img,
+                    size=p.size,
+                ),
+                page=p.page,
+            )
+
+            if not is_last:
+                intermediates.append(step_output)
+            current_input = step_output
+    finally:
+        delete_temp_files(intermediates)
+
+    return output_pdf
+
+
 @app.post("/sign-pdf")
 def sign_pdf_endpoint(
     pdf_file: UploadFile = File(..., description="The PDF document to sign"),
@@ -280,6 +406,72 @@ def sign_pdf_endpoint(
             output_pdf=output_pdf_path,
             signature=sig_config,
             page=page,
+        )
+
+        return FileResponse(
+            path=output_pdf_path,
+            filename=f"signed_{pdf_file.filename}",
+            media_type="application/pdf",
+        )
+
+    except Exception as e:
+        delete_temp_files(temp_files)
+        raise HTTPException(status_code=400, detail=f"PDF signing failed: {str(e)}")
+
+
+@app.post("/sign-pdf-multiple")
+def sign_pdf_multiple_endpoint(
+    pdf_file: UploadFile = File(..., description="The PDF document to sign"),
+    pfx_file: UploadFile = File(..., description="The PKCS#12 (.pfx/.p12) certificate file"),
+    passphrase: str = Form(..., description="Passphrase for the certificate"),
+    page_settings: str = Form(
+        ...,
+        description=(
+            "JSON array, one object per signature, applied in order: "
+            '[{"page": 0, "box_x": 50, "box_y": 50, "signature_width": 144, "signature_height": 54}, ...]. '
+            "page (0-indexed), box_x and box_y are required; signature_width / signature_height "
+            "are optional and never go below 144 x 54."
+        ),
+    ),
+    background_img: Optional[UploadFile] = File(None, description="Optional background image file"),
+):
+    temp_files = []
+
+    try:
+        # Validate the settings first, before touching any files.
+        placements = parse_page_settings(page_settings)
+
+        temp_dir = tempfile.mkdtemp()
+
+        # 1. Save uploaded PDF
+        input_pdf_path = os.path.join(temp_dir, f"input_{uuid.uuid4().hex}.pdf")
+        with open(input_pdf_path, "wb") as f:
+            f.write(pdf_file.file.read())
+        temp_files.append(input_pdf_path)
+
+        # 2. Save uploaded PFX
+        pfx_path = os.path.join(temp_dir, f"cert_{uuid.uuid4().hex}.pfx")
+        with open(pfx_path, "wb") as f:
+            f.write(pfx_file.file.read())
+        temp_files.append(pfx_path)
+
+        # 3. Save optional background image
+        bg_img_path = None
+        if background_img and background_img.filename:
+            bg_img_path = os.path.join(temp_dir, f"bg_{uuid.uuid4().hex}_{background_img.filename}")
+            with open(bg_img_path, "wb") as f:
+                f.write(background_img.file.read())
+            temp_files.append(bg_img_path)
+
+        output_pdf_path = os.path.join(temp_dir, f"signed_{uuid.uuid4().hex}.pdf")
+
+        sign_pdf_multiple(
+            input_pdf=input_pdf_path,
+            output_pdf=output_pdf_path,
+            pfx_path=pfx_path,
+            passphrase=passphrase.encode("utf-8"),
+            placements=placements,
+            background_img=bg_img_path,
         )
 
         return FileResponse(
