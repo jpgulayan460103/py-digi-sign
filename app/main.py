@@ -163,7 +163,7 @@ def prepare_background(
     dst_path: str,
     box_w: float,
     box_h: float,
-    fade: float = 0.85,
+    fade: float = 0.5,
     padding_ratio: float = 0.06,
     scale: int = 4,
 ) -> str:
