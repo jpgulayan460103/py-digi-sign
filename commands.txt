@@ -1,2 +1,2 @@
-docker build -t my-fastapi-app .
-docker run -d --name fastapi-container -p 8000:8000 my-fastapi-app
+docker build -t digital-signing .
+docker run -d --name digital-signing-container -p 8000:8000 digital-signing
