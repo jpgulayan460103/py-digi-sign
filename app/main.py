@@ -275,7 +275,7 @@ def sign_pdf(input_pdf: str, output_pdf: str, signature: SignatureConfig, page: 
                     x_align=AxisAlignment.ALIGN_MID,
                     y_align=AxisAlignment.ALIGN_MID,
                     margins=Margins(),   # image already matches the box exactly
-                    inner_content_scaling=InnerScaling.STRETCH_TO_FIT,
+                    inner_content_scaling=InnerScaling.NO_SCALING,
                 ),
                 stamp_text=stamp_text,
                 background=images.PdfImage(bg_path) if bg_path else None,
