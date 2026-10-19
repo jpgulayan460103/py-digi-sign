@@ -263,7 +263,7 @@ def sign_pdf(input_pdf: str, output_pdf: str, signature: SignatureConfig, page: 
             meta = signers.PdfSignatureMetadata(field_name=signature_field_name)
 
             style = stamp.TextStampStyle(
-                background_opacity=1,   # fading is baked into the image
+                background_opacity=0.5,   # fading is baked into the image
                 border_width=0,
                 text_box_style=TextBoxStyle(font=BOLD_FONT, font_size=font_size, leading=font_size * Fraction(6, 5)),
                 inner_content_layout=SimpleBoxLayoutRule(
@@ -275,7 +275,7 @@ def sign_pdf(input_pdf: str, output_pdf: str, signature: SignatureConfig, page: 
                     x_align=AxisAlignment.ALIGN_MID,
                     y_align=AxisAlignment.ALIGN_MID,
                     margins=Margins(),   # image already matches the box exactly
-                    inner_content_scaling=InnerScaling.NO_SCALING,
+                    inner_content_scaling=InnerScaling.SHRINK_TO_FIT,
                 ),
                 stamp_text=stamp_text,
                 background=images.PdfImage(bg_path) if bg_path else None,
