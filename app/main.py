@@ -167,22 +167,38 @@ def prepare_background(
     padding_ratio: float = 0.06,
     scale: int = 4,
 ) -> str:
-    """Fit the image onto a solid white canvas that matches the signature box.
+    """Fit the image onto a TRANSPARENT canvas that matches the signature box.
 
     - keeps the image's aspect ratio and centers it
-    - fills all leftover space with white
+    - leftover space and the image's own white background become transparent,
+      so the page content underneath stays visible
     - fades the image (fade=1 -> full strength) so the text on top stays readable
     """
     w, h = int(box_w * scale), int(box_h * scale)
-    canvas = Image.new("RGBA", (w, h), (255, 255, 255, 255))
 
-    img = Image.open(src_path).convert("RGBA")
+    img = Image.open(src_path)
+    if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+        img = img.convert("RGBA")
+        alpha = img.getchannel("A")
+    else:
+        # No alpha (e.g. JPG, ink on white paper): treat brightness as opacity,
+        # so white -> fully transparent and dark ink -> fully opaque.
+        rgb = img.convert("RGB")
+        alpha = ImageOps.invert(rgb.convert("L"))
+        # Clean up near-white noise / JPEG artifacts around the strokes.
+        alpha = alpha.point(lambda a: 0 if a < 24 else min(255, int((a - 24) * 255 / (255 - 24))))
+        img = rgb.convert("RGBA")
+
+    img.putalpha(alpha)
+    # Fade the strokes. Only the alpha is scaled, so the ink colour stays crisp.
+    img.putalpha(img.getchannel("A").point(lambda a: int(a * fade)))
+
     inner = (int(w * (1 - 2 * padding_ratio)), int(h * (1 - 2 * padding_ratio)))
     img = ImageOps.contain(img, inner)  # scales up or down, keeps aspect ratio
-    canvas.alpha_composite(img, ((w - img.width) // 2, (h - img.height) // 2))
 
-    white = Image.new("RGBA", (w, h), (255, 255, 255, 255))
-    Image.blend(white, canvas, fade).convert("RGB").save(dst_path, "PNG")
+    canvas = Image.new("RGBA", (w, h), (255, 255, 255, 0))  # fully transparent
+    canvas.alpha_composite(img, ((w - img.width) // 2, (h - img.height) // 2))
+    canvas.save(dst_path, "PNG")
     return dst_path
 
 
